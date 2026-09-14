@@ -748,15 +748,7 @@ func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, curre
 	perNodeGroup := make(map[string]Readiness)
 	total := Readiness{Time: currentTime}
 	nodeGroupLookupErrors := make(map[string]struct{})
-	maxNodeStartupTime := MaxNodeStartupTime
-	update := func(current Readiness, node *apiv1.Node, nr kube_util.NodeReadiness) Readiness {
-		nodeGroup, errNg := csr.cloudProvider.NodeGroupForNode(ctx, node)
-		if errNg == nil && nodeGroup != nil {
-			if startupTime, err := csr.nodeGroupConfigProcessor.GetMaxNodeStartupTime(ctx, nodeGroup); err == nil {
-				maxNodeStartupTime = startupTime
-			}
-		}
-		logger.V(5).Info("Node: using maxNodeStartupTime", "nodeName", node.Name, "maxNodeStartupTime", maxNodeStartupTime)
+	update := func(current Readiness, node *apiv1.Node, nr kube_util.NodeReadiness, maxNodeStartupTime time.Duration) Readiness {
 		current.Registered = append(current.Registered, node.Name)
 		if _, isDeleted := csr.deletedNodes[node.Name]; isDeleted {
 			current.Deleted = append(current.Deleted, node.Name)
@@ -778,6 +770,15 @@ func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, curre
 	for _, node := range csr.nodes {
 		nodeGroup, errNg := csr.cloudProvider.NodeGroupForNode(ctx, node)
 		nr, errReady := kube_util.GetNodeReadiness(node)
+		// Resolve the startup timeout once per node so group and total readiness agree,
+		// and lookup failures cannot inherit another node group's startup grace period.
+		maxNodeStartupTime := MaxNodeStartupTime
+		if errNg == nil && nodeGroup != nil {
+			if startupTime, err := csr.nodeGroupConfigProcessor.GetMaxNodeStartupTime(ctx, nodeGroup); err == nil {
+				maxNodeStartupTime = startupTime
+			}
+		}
+		logger.V(5).Info("Node: using maxNodeStartupTime", "nodeName", node.Name, "maxNodeStartupTime", maxNodeStartupTime)
 
 		// A nil group with no error identifies a node outside autoscaled node groups.
 		// Keep failed lookups separate so unknown ownership does not exclude a node from the health check.
@@ -790,9 +791,9 @@ func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, curre
 				logger.Info("Failed to get readiness info for node", "nodeName", node.Name, "err", errReady)
 			}
 		} else {
-			perNodeGroup[nodeGroup.Id()] = update(perNodeGroup[nodeGroup.Id()], node, nr)
+			perNodeGroup[nodeGroup.Id()] = update(perNodeGroup[nodeGroup.Id()], node, nr, maxNodeStartupTime)
 		}
-		total = update(total, node, nr)
+		total = update(total, node, nr, maxNodeStartupTime)
 	}
 
 	for _, unregistered := range csr.unregisteredNodes {

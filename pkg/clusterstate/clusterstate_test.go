@@ -716,6 +716,137 @@ func TestIsClusterHealthyNodeGroupLookupFailureRecovery(t *testing.T) {
 	assert.True(t, clusterstate.IsClusterHealthy())
 }
 
+func TestIsClusterHealthyNodeGroupLookupFailureNodeRemoval(t *testing.T) {
+	now := time.Now()
+	provider := testprovider.NewTestCloudProviderBuilder().WithNodeProcessingError([]string{"failed-0", "failed-1", "failed-2"}).Build()
+	provider.AddNodeGroup("ng1", 0, 10, 5)
+	var nodes []*apiv1.Node
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("managed-%d", i)
+		if i >= 2 {
+			name = fmt.Sprintf("failed-%d", i-2)
+		}
+		node := BuildTestNode(name, 1000, 1000)
+		SetNodeReadyState(node, i >= 2, now.Add(-time.Minute))
+		node.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
+		provider.AddNode("ng1", node)
+		nodes = append(nodes, node)
+	}
+	fakeLogRecorder, _ := utils.NewStatusMapRecorder(&fake.Clientset{}, "kube-system", kube_record.NewFakeRecorder(5), false, "my-cool-configmap")
+	clusterstate := newTestClusterStateRegistry(provider, fakeLogRecorder, WithConfig(ClusterStateRegistryConfig{
+		MaxTotalUnreadyPercentage: 50,
+		OkTotalUnreadyCount:       1,
+		UnreadyNodesScope:         config.UnreadyNodesScopeAutoscaled,
+	}))
+	assert.NoError(t, clusterstate.UpdateNodes(context.Background(), nodes, now))
+	assert.True(t, clusterstate.IsClusterHealthy())
+
+	// Removed ready nodes must leave the denominator even while their cloud instances remain.
+	assert.NoError(t, clusterstate.UpdateNodes(context.Background(), nodes[:2], now.Add(time.Minute)))
+	assert.Len(t, clusterstate.GetUnregisteredNodes(), 3)
+	assert.False(t, clusterstate.IsClusterHealthy())
+}
+
+type transientNodeGroupLookupErrorProvider struct {
+	cloudprovider.CloudProvider
+	nodeName string
+	calls    int
+}
+
+func (p *transientNodeGroupLookupErrorProvider) NodeGroupForNode(ctx context.Context, node *apiv1.Node) (cloudprovider.NodeGroup, error) {
+	if node.Name == p.nodeName {
+		p.calls++
+		if p.calls == 2 {
+			return nil, fmt.Errorf("transient node group lookup failure")
+		}
+	}
+	return p.CloudProvider.NodeGroupForNode(ctx, node)
+}
+
+func TestReadinessConsistentAcrossScopesWithTransientLookupFailure(t *testing.T) {
+	now := time.Now()
+	provider := testprovider.NewTestCloudProviderBuilder().Build()
+	provider.AddNodeGroupWithCustomOptions("long-startup", 0, 10, 1, &config.NodeGroupAutoscalingOptions{MaxNodeStartupTime: time.Hour})
+	provider.AddNodeGroupWithCustomOptions("short-startup", 0, 10, 2, &config.NodeGroupAutoscalingOptions{MaxNodeStartupTime: 35 * time.Minute})
+	var nodes []*apiv1.Node
+	for _, name := range []string{"ready", "unready-0", "unready-1"} {
+		node := BuildTestNode(name, 1000, 1000)
+		SetNodeReadyState(node, name == "ready", now.Add(-time.Minute))
+		node.CreationTimestamp = metav1.NewTime(now.Add(-40 * time.Minute))
+		group := "short-startup"
+		if name == "ready" {
+			group = "long-startup"
+		}
+		provider.AddNode(group, node)
+		nodes = append(nodes, node)
+	}
+	// If group and total readiness resolve ownership separately, a transient error
+	// can make the same node inherit the preceding group's longer startup timeout.
+	clusterstate := &ClusterStateRegistry{
+		cloudProvider:            &transientNodeGroupLookupErrorProvider{CloudProvider: provider, nodeName: "unready-0"},
+		nodes:                    nodes,
+		nodeGroupConfigProcessor: nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeStartupTime: MaxNodeStartupTime}),
+		config: ClusterStateRegistryConfig{
+			MaxTotalUnreadyPercentage: 10,
+			OkTotalUnreadyCount:       1,
+		},
+	}
+	clusterstate.updateReadinessStats(context.Background(), now)
+	assert.ElementsMatch(t, []string{"unready-0", "unready-1"}, clusterstate.totalReadiness.Unready)
+	assert.ElementsMatch(t, clusterstate.totalReadiness.Unready, clusterstate.perNodeGroupReadiness["short-startup"].Unready)
+	assert.False(t, clusterstate.IsClusterHealthy())
+	clusterstate.config.UnreadyNodesScope = config.UnreadyNodesScopeAutoscaled
+	assert.False(t, clusterstate.IsClusterHealthy())
+}
+
+func TestNodeGroupLookupFailureStartupGraceIsIndependentOfNodeOrder(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name              string
+		knownGroupStartup time.Duration
+		failedNodeAge     time.Duration
+		wantHealthy       bool
+	}{
+		{"expired grace", time.Hour, 2 * MaxNodeStartupTime, false},
+		{"within grace", time.Minute, MaxNodeStartupTime / 2, true},
+	} {
+		for _, knownNodeFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/knownNodeFirst=%t", tc.name, knownNodeFirst), func(t *testing.T) {
+				provider := testprovider.NewTestCloudProviderBuilder().WithNodeProcessingError([]string{"failed-0", "failed-1"}).Build()
+				provider.AddNodeGroupWithCustomOptions("known", 0, 10, 1, &config.NodeGroupAutoscalingOptions{MaxNodeStartupTime: tc.knownGroupStartup})
+				known := BuildTestNode("known", 1000, 1000)
+				SetNodeReadyState(known, true, now.Add(-time.Minute))
+				provider.AddNode("known", known)
+				var nodes []*apiv1.Node
+				for _, name := range []string{"failed-0", "failed-1"} {
+					node := BuildTestNode(name, 1000, 1000)
+					SetNodeReadyState(node, false, now.Add(-time.Minute))
+					node.CreationTimestamp = metav1.NewTime(now.Add(-tc.failedNodeAge))
+					nodes = append(nodes, node)
+				}
+				if knownNodeFirst {
+					nodes = append([]*apiv1.Node{known}, nodes...)
+				} else {
+					nodes = append(nodes, known)
+				}
+				clusterstate := &ClusterStateRegistry{
+					cloudProvider:            provider,
+					nodes:                    nodes,
+					nodeGroupConfigProcessor: nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeStartupTime: MaxNodeStartupTime}),
+					config: ClusterStateRegistryConfig{
+						MaxTotalUnreadyPercentage: 10,
+						OkTotalUnreadyCount:       1,
+					},
+				}
+				clusterstate.updateReadinessStats(context.Background(), now)
+				assert.Equal(t, tc.wantHealthy, clusterstate.IsClusterHealthy())
+				clusterstate.config.UnreadyNodesScope = config.UnreadyNodesScopeAutoscaled
+				assert.Equal(t, tc.wantHealthy, clusterstate.IsClusterHealthy())
+			})
+		}
+	}
+}
+
 func TestUnreadyLongAfterCreation(t *testing.T) {
 	now := time.Now()
 
