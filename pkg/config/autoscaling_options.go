@@ -147,7 +147,7 @@ type AutoscalingOptions struct {
 	OkTotalUnreadyCount int
 	// UnreadyNodesScope selects which nodes the cluster-wide unready node check counts.
 	// UnreadyNodesScopeCluster counts every node in the cluster, UnreadyNodesScopeAutoscaled
-	// counts only nodes belonging to an autoscaled node group.
+	// counts nodes belonging to an autoscaled node group or whose node group lookup failed.
 	UnreadyNodesScope string
 	// ScaleUpFromZero defines if CA should scale up when there 0 ready nodes.
 	ScaleUpFromZero bool

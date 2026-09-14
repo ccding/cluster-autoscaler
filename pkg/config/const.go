@@ -59,7 +59,7 @@ const (
 	// unready nodes across every node in the cluster.
 	UnreadyNodesScopeCluster = "cluster"
 	// UnreadyNodesScopeAutoscaled makes the cluster-wide unready node check count
-	// only the nodes that belong to an autoscaled node group.
+	// nodes that belong to an autoscaled node group or whose node group lookup failed.
 	UnreadyNodesScopeAutoscaled = "autoscaled"
 )
 
